@@ -20,6 +20,7 @@ jobs:
       SVTAV1PSY_REF: main
       FFMPEG_REF: n7.1
       OPUS_VERSION: "1.5.2"
+      VMAF_VERSION: "3.0.0"
 
     steps:
       - name: Checkout (this repo, for the toolchain file)
@@ -77,7 +78,29 @@ jobs:
           make install
 
       # ---------------------------------------------------------------
-      # 3) FFmpeg  (static ffmpeg.exe + ffprobe.exe)
+      # 3) libvmaf  (static) -- for VMAF scoring
+      # ---------------------------------------------------------------
+      - name: Build libvmaf
+        run: |
+          cd "$SRC"
+          git clone --depth 1 -b "v${VMAF_VERSION}" https://github.com/Netflix/vmaf.git vmaf
+          cd vmaf/libvmaf
+          meson setup build \
+            --cross-file "$GITHUB_WORKSPACE/toolchain/meson-cross-mingw64.ini" \
+            --prefix "$PREFIX" \
+            --buildtype release \
+            --default-library static \
+            -Denable_tests=false \
+            -Denable_docs=false \
+            -Dbuilt_in_models=true
+          ninja -C build -j$(nproc)
+          ninja -C build install
+          # meson may drop the .pc under lib/x86_64-.../pkgconfig -> normalize
+          find "$PREFIX" -name 'libvmaf.pc' -exec cp {} "$PREFIX/lib/pkgconfig/" \; 2>/dev/null || true
+          cat "$PREFIX/lib/pkgconfig/libvmaf.pc"
+
+      # ---------------------------------------------------------------
+      # 4) FFmpeg  (static ffmpeg.exe + ffprobe.exe)
       # ---------------------------------------------------------------
       - name: Build FFmpeg
         run: |
@@ -96,13 +119,15 @@ jobs:
             --enable-static --disable-shared \
             --enable-libsvtav1 \
             --enable-libopus \
+            --enable-libvmaf \
             --extra-cflags="-I$PREFIX/include" \
             --extra-ldflags="-L$PREFIX/lib -static -static-libgcc -static-libstdc++" \
             --extra-libs="-lstdc++ -lpthread" \
             --disable-debug --disable-doc
-          # sanity: both must be enabled or fail the build now
+          # sanity: all must be enabled or fail the build now
           grep -q "CONFIG_LIBSVTAV1_ENCODER 1" config_components.h
           grep -q "CONFIG_LIBOPUS_ENCODER 1" config_components.h
+          grep -q "CONFIG_LIBVMAF_FILTER 1" config_components.h
           make -j$(nproc)
           make install
 
