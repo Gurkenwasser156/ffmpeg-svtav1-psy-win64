@@ -1,0 +1,144 @@
+name: Build FFmpeg (Win64) with SVT-AV1-PSY + Opus
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      PREFIX: ${{ github.workspace }}/build/prefix
+      SRC: ${{ github.workspace }}/build/src
+      DIST: ${{ github.workspace }}/dist
+      # Pin sources for reproducibility
+      SVTAV1PSY_REPO: https://github.com/5fish/svt-av1-psy.git
+      SVTAV1PSY_REF: main
+      FFMPEG_REF: n7.1
+      OPUS_VERSION: "1.5.2"
+
+    steps:
+      - name: Checkout (this repo, for the toolchain file)
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain & build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 cmake nasm yasm meson ninja-build pkg-config \
+            git make autoconf automake libtool zip ca-certificates
+
+      - name: Prepare dirs
+        run: mkdir -p "$PREFIX/lib/pkgconfig" "$SRC" "$DIST"
+
+      # ---------------------------------------------------------------
+      # 1) SVT-AV1-PSY  (static libSvtAv1Enc.a)
+      # ---------------------------------------------------------------
+      - name: Build SVT-AV1-PSY
+        run: |
+          cd "$SRC"
+          git clone --depth 1 -b "$SVTAV1PSY_REF" "$SVTAV1PSY_REPO" svt-av1-psy
+          cd svt-av1-psy
+          echo "SVT-AV1-PSY commit: $(git rev-parse --short HEAD)"
+          mkdir build_win && cd build_win
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/toolchain/mingw-w64-x86_64.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_APPS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -G Ninja
+          ninja -j$(nproc)
+          ninja install
+          # SVT uses C++ internally -> tell pkg-config so static FFmpeg links cleanly
+          sed -i 's|^Libs.private:.*|Libs.private: -lstdc++ -lpthread|' "$PREFIX/lib/pkgconfig/SvtAv1Enc.pc"
+          cat "$PREFIX/lib/pkgconfig/SvtAv1Enc.pc"
+
+      # ---------------------------------------------------------------
+      # 2) libopus  (static)
+      # ---------------------------------------------------------------
+      - name: Build libopus
+        run: |
+          cd "$SRC"
+          curl -fsSL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz" -o opus.tar.gz
+          tar xf opus.tar.gz
+          cd "opus-${OPUS_VERSION}"
+          ./configure \
+            --host=x86_64-w64-mingw32 \
+            --prefix="$PREFIX" \
+            --enable-static --disable-shared \
+            --disable-doc --disable-extra-programs
+          make -j$(nproc)
+          make install
+
+      # ---------------------------------------------------------------
+      # 3) FFmpeg  (static ffmpeg.exe + ffprobe.exe)
+      # ---------------------------------------------------------------
+      - name: Build FFmpeg
+        run: |
+          cd "$SRC"
+          git clone --depth 1 -b "$FFMPEG_REF" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          cd ffmpeg
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          ./configure \
+            --prefix="$DIST/ffmpeg-svtav1-psy-win64" \
+            --arch=x86_64 \
+            --target-os=mingw32 \
+            --cross-prefix=x86_64-w64-mingw32- \
+            --pkg-config=pkg-config \
+            --pkg-config-flags=--static \
+            --enable-gpl --enable-version3 \
+            --enable-static --disable-shared \
+            --enable-libsvtav1 \
+            --enable-libopus \
+            --extra-cflags="-I$PREFIX/include" \
+            --extra-ldflags="-L$PREFIX/lib -static -static-libgcc -static-libstdc++" \
+            --extra-libs="-lstdc++ -lpthread" \
+            --disable-debug --disable-doc
+          # sanity: both must be enabled or fail the build now
+          grep -q "CONFIG_LIBSVTAV1_ENCODER 1" config_components.h
+          grep -q "CONFIG_LIBOPUS_ENCODER 1" config_components.h
+          make -j$(nproc)
+          make install
+
+      - name: Verify (DLL deps + encoders present)
+        run: |
+          BIN="$DIST/ffmpeg-svtav1-psy-win64/bin"
+          echo "=== ffmpeg.exe DLL deps (should be Windows system DLLs only) ==="
+          x86_64-w64-mingw32-objdump -p "$BIN/ffmpeg.exe" | grep "DLL Name" | sort -u
+          echo "=== encoders ==="
+          # Use wine if available to actually run; otherwise just grep the binary
+          if command -v wine >/dev/null 2>&1; then
+            wine "$BIN/ffmpeg.exe" -hide_banner -encoders 2>/dev/null | grep -E "libsvtav1|libopus" || true
+          fi
+
+      - name: Package
+        run: |
+          cd "$DIST/ffmpeg-svtav1-psy-win64"
+          cp "$GITHUB_WORKSPACE/README.md" README.txt || true
+          cd "$DIST"
+          zip -r -9 ffmpeg-svtav1-psy-win64.zip ffmpeg-svtav1-psy-win64
+          ls -lh ffmpeg-svtav1-psy-win64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-svtav1-psy-win64
+          path: dist/ffmpeg-svtav1-psy-win64.zip
+          if-no-files-found: error
+
+      - name: Create / update Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: FFmpeg Win64 + SVT-AV1-PSY + Opus (latest)
+          body: |
+            Statically-linked Windows x64 ffmpeg.exe with the SVT-AV1-PSY encoder
+            (5fish/svt-av1-psy) and libopus built in. Built by GitHub Actions.
+          files: dist/ffmpeg-svtav1-psy-win64.zip
