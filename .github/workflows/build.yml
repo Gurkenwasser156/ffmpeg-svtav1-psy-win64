@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout (this repo, for the toolchain files)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install cross toolchain & build tools
         run: |
@@ -59,7 +59,7 @@ jobs:
       # whole install prefix and rebuild just FFmpeg on most runs.
       - name: Cache dependency prefix
         id: deps-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/prefix
           key: deps-ubuntu24-svt${{ env.SVTAV1PSY_REF }}-opus${{ env.OPUS_VERSION }}-vmaf${{ env.VMAF_VERSION }}-dav1d${{ env.DAV1D_VERSION }}-v1
@@ -202,12 +202,22 @@ jobs:
       - name: Verify (run the binaries under wine)
         env:
           WINEDEBUG: "-all"
+          WINEARCH: win64
           WINEPREFIX: /tmp/wineprefix
         run: |
+          # Ubuntu's wine64 package installs the loader as "wine64", not "wine".
+          WINE="$(command -v wine64 || command -v wine || true)"
+          if [ -z "$WINE" ]; then
+            echo "::error::wine is not installed, cannot smoke-test the binaries"
+            exit 1
+          fi
           BIN="$DIST/$PKG/bin"
-          FFMPEG="wine $BIN/ffmpeg.exe"
-          FFPROBE="wine $BIN/ffprobe.exe"
-          wineboot -i >/dev/null 2>&1 || true
+          FFMPEG="$WINE $BIN/ffmpeg.exe"
+          FFPROBE="$WINE $BIN/ffprobe.exe"
+          "$WINE" wineboot -i >/dev/null 2>&1 || true
+          # Work in the temp dir so file arguments stay relative and wine does
+          # not have to translate unix paths.
+          cd "$RUNNER_TEMP"
 
           $FFMPEG -hide_banner -encoders | grep -q libsvtav1
           $FFMPEG -hide_banner -encoders | grep -q libopus
@@ -221,17 +231,17 @@ jobs:
             -f lavfi -i "sine=frequency=440:duration=2" \
             -c:v libsvtav1 -preset 10 -crf 40 \
             -svtav1-params "tune=3:enable-variance-boost=1" \
-            -c:a libopus -b:a 96k /tmp/smoke.mkv
-          test -s /tmp/smoke.mkv
+            -c:a libopus -b:a 96k smoke.mkv
+          test -s smoke.mkv
 
           echo "=== decode back (libdav1d) ==="
           test "$($FFPROBE -v error -select_streams v:0 \
-            -show_entries stream=codec_name -of csv=p=0 /tmp/smoke.mkv | tr -d '\r')" = av1
+            -show_entries stream=codec_name -of csv=p=0 smoke.mkv | tr -d '\r')" = av1
 
           echo "=== VMAF scoring ==="
-          $FFMPEG -hide_banner -i /tmp/smoke.mkv -f lavfi -i "$SRC_LAVFI" \
-            -lavfi "[0:v][1:v]libvmaf=n_threads=2" -f null - 2>&1 | tee /tmp/vmaf.log
-          grep -q "VMAF score" /tmp/vmaf.log
+          $FFMPEG -hide_banner -i smoke.mkv -f lavfi -i "$SRC_LAVFI" \
+            -lavfi "[0:v][1:v]libvmaf=n_threads=2" -f null - 2>&1 | tee vmaf.log
+          grep -q "VMAF score" vmaf.log
 
       - name: Package
         id: package
@@ -272,7 +282,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PKG }}
           path: |
@@ -283,7 +293,7 @@ jobs:
       # Immutable, dated release so an older build can always be recovered.
       - name: Publish versioned release
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: build-${{ steps.package.outputs.stamp }}
           name: FFmpeg ${{ env.FFMPEG_REF }} + SVT-AV1-PSY (${{ steps.package.outputs.stamp }})
@@ -295,7 +305,7 @@ jobs:
       # Rolling pointer that the README links to.
       - name: Update "latest" release
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
           name: FFmpeg Win64 + SVT-AV1-PSY + Opus (latest)
