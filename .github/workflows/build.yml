@@ -246,12 +246,14 @@ jobs:
           $FFMPEG -hide_banner -filters  | grep -q libvmaf
 
           SRC_LAVFI="testsrc2=size=320x240:rate=30:duration=2"
+          # The -psy-bias options exist only in the 5fish fork, so a stock
+          # SVT-AV1 slipping in would fail here rather than ship silently.
           echo "=== encode: SVT-AV1-PSY video + Opus audio ==="
           $FFMPEG -hide_banner -y \
             -f lavfi -i "$SRC_LAVFI" \
             -f lavfi -i "sine=frequency=440:duration=2" \
             -c:v libsvtav1 -preset 10 -crf 40 \
-            -svtav1-params "tune=3:enable-variance-boost=1" \
+            -svtav1-params "lineart-psy-bias=3:texture-psy-bias=3" \
             -c:a libopus -b:a 96k smoke.mkv
           test -s smoke.mkv
 
