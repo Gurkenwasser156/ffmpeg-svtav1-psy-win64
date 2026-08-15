@@ -215,7 +215,9 @@ jobs:
         env:
           WINEDEBUG: "-all"
           WINEARCH: win64
-          WINEPREFIX: /tmp/wineprefix
+          # Must live under a directory the runner user owns; wine refuses to
+          # create a prefix beneath root-owned /tmp.
+          WINEPREFIX: ${{ runner.temp }}/wineprefix
         run: |
           # Depending on which wine package resolved, the loader is called
           # wine, wine-stable or wine64 -- and may not be on PATH at all.
@@ -231,7 +233,9 @@ jobs:
           BIN="$DIST/$PKG/bin"
           FFMPEG="$WINE $BIN/ffmpeg.exe"
           FFPROBE="$WINE $BIN/ffprobe.exe"
-          "$WINE" wineboot -i >/dev/null 2>&1 || true
+          # Not suppressed: if the prefix cannot be set up, the reason should be
+          # in the log rather than surfacing later as an unrelated failure.
+          "$WINE" wineboot -i || true
           # Work in the temp dir so file arguments stay relative and wine does
           # not have to translate unix paths.
           cd "$RUNNER_TEMP"
