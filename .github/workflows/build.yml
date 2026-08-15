@@ -336,6 +336,7 @@ jobs:
           files: |
             dist/${{ env.PKG }}.zip
             dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
 
       # Rolling pointer that the README links to.
       - name: Update "latest" release
@@ -348,3 +349,4 @@ jobs:
           files: |
             dist/${{ env.PKG }}.zip
             dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
