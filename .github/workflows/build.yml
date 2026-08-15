@@ -338,6 +338,20 @@ jobs:
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
 
+      # action-gh-release refreshes the assets on an existing tag but leaves the
+      # tag ref where it was, so "latest" would keep pointing at whatever commit
+      # first created it. Move it ourselves, otherwise checking out "latest"
+      # hands you a recipe that did not build the binary attached to it.
+      - name: Move the "latest" tag to this commit
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" \
+            -f sha="$GITHUB_SHA" -F force=true \
+          || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+               -f ref="refs/tags/latest" -f sha="$GITHUB_SHA"
+
       # Rolling pointer that the README links to.
       - name: Update "latest" release
         if: github.ref == 'refs/heads/main'
