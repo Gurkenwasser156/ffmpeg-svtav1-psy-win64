@@ -49,17 +49,22 @@ jobs:
 
       - name: Install wine (to smoke-test the Windows binaries)
         run: |
-          sudo apt-get install -y --no-install-recommends wine64 \
-            || sudo apt-get install -y --no-install-recommends wine
+          # "wine64" ships only /usr/lib/wine/wine64; the wrapper on PATH comes
+          # from "wine". Ask for both, but tolerate the wrapper being missing.
+          sudo apt-get install -y --no-install-recommends wine64 wine \
+            || sudo apt-get install -y --no-install-recommends wine64
 
       - name: Prepare dirs
         run: mkdir -p "$PREFIX/lib/pkgconfig" "$SRC" "$DIST"
 
       # Dependencies change only when their pinned version changes, so cache the
-      # whole install prefix and rebuild just FFmpeg on most runs.
-      - name: Cache dependency prefix
+      # whole install prefix and rebuild just FFmpeg on most runs. Restore and
+      # save are split so a later failure (FFmpeg, verification) does not throw
+      # away dependencies that built fine -- plain actions/cache only saves when
+      # the whole job succeeds.
+      - name: Restore dependency prefix
         id: deps-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: build/prefix
           key: deps-ubuntu24-svt${{ env.SVTAV1PSY_REF }}-opus${{ env.OPUS_VERSION }}-vmaf${{ env.VMAF_VERSION }}-dav1d${{ env.DAV1D_VERSION }}-v1
@@ -150,6 +155,13 @@ jobs:
           ninja -C build install
           test -f "$PREFIX/lib/pkgconfig/dav1d.pc"
 
+      - name: Save dependency prefix
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: build/prefix
+          key: deps-ubuntu24-svt${{ env.SVTAV1PSY_REF }}-opus${{ env.OPUS_VERSION }}-vmaf${{ env.VMAF_VERSION }}-dav1d${{ env.DAV1D_VERSION }}-v1
+
       # ---------------------------------------------------------------
       # 5) FFmpeg  (static ffmpeg.exe + ffprobe.exe)
       # ---------------------------------------------------------------
@@ -205,12 +217,17 @@ jobs:
           WINEARCH: win64
           WINEPREFIX: /tmp/wineprefix
         run: |
-          # Ubuntu's wine64 package installs the loader as "wine64", not "wine".
-          WINE="$(command -v wine64 || command -v wine || true)"
+          # Depending on which wine package resolved, the loader is called
+          # wine, wine-stable or wine64 -- and may not be on PATH at all.
+          WINE=""
+          for cand in wine wine-stable wine64 /usr/lib/wine/wine64; do
+            if command -v "$cand" >/dev/null 2>&1; then WINE="$cand"; break; fi
+          done
           if [ -z "$WINE" ]; then
-            echo "::error::wine is not installed, cannot smoke-test the binaries"
+            echo "::error::no wine loader found, cannot smoke-test the binaries"
             exit 1
           fi
+          echo "using wine loader: $WINE"
           BIN="$DIST/$PKG/bin"
           FFMPEG="$WINE $BIN/ffmpeg.exe"
           FFPROBE="$WINE $BIN/ffprobe.exe"
