@@ -4,26 +4,40 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
     env:
       PREFIX: ${{ github.workspace }}/build/prefix
       SRC: ${{ github.workspace }}/build/src
       DIST: ${{ github.workspace }}/dist
-      # Pin sources for reproducibility
-      SVTAV1PSY_REPO: https://github.com/5fish/svt-av1-psy.git
-      SVTAV1PSY_REF: main
-      FFMPEG_REF: n7.1
-      OPUS_VERSION: "1.5.2"
-      VMAF_VERSION: "3.0.0"
+      PKG: ffmpeg-svtav1-psy-win64
+      # Every source is pinned to an immutable tag so a rebuild reproduces the
+      # same binary. Bump these deliberately; never track a moving branch.
+      SVTAV1PSY_REPO: https://github.com/5fish/SVT-AV1.git
+      SVTAV1PSY_REF: v2.3.260719
+      FFMPEG_REF: n9.0.1
+      OPUS_VERSION: "1.6.1"
+      OPUS_SHA256: 6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
+      VMAF_VERSION: "3.2.0"
+      DAV1D_VERSION: "1.5.4"
 
     steps:
-      - name: Checkout (this repo, for the toolchain file)
+      - name: Checkout (this repo, for the toolchain files)
         uses: actions/checkout@v4
 
       - name: Install cross toolchain & build tools
@@ -33,18 +47,33 @@ jobs:
             mingw-w64 cmake nasm yasm meson ninja-build pkg-config \
             git make autoconf automake libtool zip ca-certificates
 
+      - name: Install wine (to smoke-test the Windows binaries)
+        run: |
+          sudo apt-get install -y --no-install-recommends wine64 \
+            || sudo apt-get install -y --no-install-recommends wine
+
       - name: Prepare dirs
         run: mkdir -p "$PREFIX/lib/pkgconfig" "$SRC" "$DIST"
+
+      # Dependencies change only when their pinned version changes, so cache the
+      # whole install prefix and rebuild just FFmpeg on most runs.
+      - name: Cache dependency prefix
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: build/prefix
+          key: deps-ubuntu24-svt${{ env.SVTAV1PSY_REF }}-opus${{ env.OPUS_VERSION }}-vmaf${{ env.VMAF_VERSION }}-dav1d${{ env.DAV1D_VERSION }}-v1
 
       # ---------------------------------------------------------------
       # 1) SVT-AV1-PSY  (static libSvtAv1Enc.a)
       # ---------------------------------------------------------------
       - name: Build SVT-AV1-PSY
+        if: steps.deps-cache.outputs.cache-hit != 'true'
         run: |
           cd "$SRC"
           git clone --depth 1 -b "$SVTAV1PSY_REF" "$SVTAV1PSY_REPO" svt-av1-psy
           cd svt-av1-psy
-          echo "SVT-AV1-PSY commit: $(git rev-parse --short HEAD)"
+          git rev-parse HEAD > "$PREFIX/.svt-commit"
           mkdir build_win && cd build_win
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/toolchain/mingw-w64-x86_64.cmake" \
@@ -58,15 +87,16 @@ jobs:
           ninja install
           # SVT uses C++ internally -> tell pkg-config so static FFmpeg links cleanly
           sed -i 's|^Libs.private:.*|Libs.private: -lstdc++ -lpthread|' "$PREFIX/lib/pkgconfig/SvtAv1Enc.pc"
-          cat "$PREFIX/lib/pkgconfig/SvtAv1Enc.pc"
 
       # ---------------------------------------------------------------
       # 2) libopus  (static)
       # ---------------------------------------------------------------
       - name: Build libopus
+        if: steps.deps-cache.outputs.cache-hit != 'true'
         run: |
           cd "$SRC"
           curl -fsSL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz" -o opus.tar.gz
+          echo "${OPUS_SHA256}  opus.tar.gz" | sha256sum -c -
           tar xf opus.tar.gz
           cd "opus-${OPUS_VERSION}"
           ./configure \
@@ -81,6 +111,7 @@ jobs:
       # 3) libvmaf  (static) -- for VMAF scoring
       # ---------------------------------------------------------------
       - name: Build libvmaf
+        if: steps.deps-cache.outputs.cache-hit != 'true'
         run: |
           cd "$SRC"
           git clone --depth 1 -b "v${VMAF_VERSION}" https://github.com/Netflix/vmaf.git vmaf
@@ -88,6 +119,7 @@ jobs:
           meson setup build \
             --cross-file "$GITHUB_WORKSPACE/toolchain/meson-cross-mingw64.ini" \
             --prefix "$PREFIX" \
+            --libdir lib \
             --buildtype release \
             --default-library static \
             -Denable_tests=false \
@@ -95,12 +127,31 @@ jobs:
             -Dbuilt_in_models=true
           ninja -C build -j$(nproc)
           ninja -C build install
-          # meson may drop the .pc under lib/x86_64-.../pkgconfig -> normalize
-          find "$PREFIX" -name 'libvmaf.pc' -exec cp {} "$PREFIX/lib/pkgconfig/" \; 2>/dev/null || true
-          cat "$PREFIX/lib/pkgconfig/libvmaf.pc"
+          test -f "$PREFIX/lib/pkgconfig/libvmaf.pc"
 
       # ---------------------------------------------------------------
-      # 4) FFmpeg  (static ffmpeg.exe + ffprobe.exe)
+      # 4) libdav1d  (static) -- fast AV1 decoding
+      # ---------------------------------------------------------------
+      - name: Build libdav1d
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$SRC"
+          git clone --depth 1 -b "$DAV1D_VERSION" https://code.videolan.org/videolan/dav1d.git dav1d
+          cd dav1d
+          meson setup build \
+            --cross-file "$GITHUB_WORKSPACE/toolchain/meson-cross-mingw64.ini" \
+            --prefix "$PREFIX" \
+            --libdir lib \
+            --buildtype release \
+            --default-library static \
+            -Denable_tools=false \
+            -Denable_tests=false
+          ninja -C build -j$(nproc)
+          ninja -C build install
+          test -f "$PREFIX/lib/pkgconfig/dav1d.pc"
+
+      # ---------------------------------------------------------------
+      # 5) FFmpeg  (static ffmpeg.exe + ffprobe.exe)
       # ---------------------------------------------------------------
       - name: Build FFmpeg
         run: |
@@ -109,7 +160,7 @@ jobs:
           cd ffmpeg
           export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
           ./configure \
-            --prefix="$DIST/ffmpeg-svtav1-psy-win64" \
+            --prefix="$DIST/$PKG" \
             --arch=x86_64 \
             --target-os=mingw32 \
             --cross-prefix=x86_64-w64-mingw32- \
@@ -120,6 +171,7 @@ jobs:
             --enable-libsvtav1 \
             --enable-libopus \
             --enable-libvmaf \
+            --enable-libdav1d \
             --extra-cflags="-I$PREFIX/include" \
             --extra-ldflags="-L$PREFIX/lib -static -static-libgcc -static-libstdc++" \
             --extra-libs="-lstdc++ -lpthread" \
@@ -128,42 +180,126 @@ jobs:
           grep -q "CONFIG_LIBSVTAV1_ENCODER 1" config_components.h
           grep -q "CONFIG_LIBOPUS_ENCODER 1" config_components.h
           grep -q "CONFIG_LIBVMAF_FILTER 1" config_components.h
+          grep -q "CONFIG_LIBDAV1D_DECODER 1" config_components.h
           make -j$(nproc)
           make install
 
-      - name: Verify (DLL deps + encoders present)
+      - name: Verify (static linkage)
         run: |
-          BIN="$DIST/ffmpeg-svtav1-psy-win64/bin"
-          echo "=== ffmpeg.exe DLL deps (should be Windows system DLLs only) ==="
-          x86_64-w64-mingw32-objdump -p "$BIN/ffmpeg.exe" | grep "DLL Name" | sort -u
-          echo "=== encoders ==="
-          # Use wine if available to actually run; otherwise just grep the binary
-          if command -v wine >/dev/null 2>&1; then
-            wine "$BIN/ffmpeg.exe" -hide_banner -encoders 2>/dev/null | grep -E "libsvtav1|libopus" || true
-          fi
+          BIN="$DIST/$PKG/bin"
+          for exe in ffmpeg.exe ffprobe.exe; do
+            echo "=== $exe imports ==="
+            x86_64-w64-mingw32-objdump -p "$BIN/$exe" | grep "DLL Name" | sort -u
+            # Anything we compiled ourselves, or a runtime that is not on stock
+            # Windows, must be inside the binary -- not an import.
+            if x86_64-w64-mingw32-objdump -p "$BIN/$exe" | grep "DLL Name" \
+                 | grep -iE "svt|opus|vmaf|dav1d|libgcc|libstdc|winpthread|libssp"; then
+              echo "::error::$exe is not fully static"
+              exit 1
+            fi
+          done
+
+      - name: Verify (run the binaries under wine)
+        env:
+          WINEDEBUG: "-all"
+          WINEPREFIX: /tmp/wineprefix
+        run: |
+          BIN="$DIST/$PKG/bin"
+          FFMPEG="wine $BIN/ffmpeg.exe"
+          FFPROBE="wine $BIN/ffprobe.exe"
+          wineboot -i >/dev/null 2>&1 || true
+
+          $FFMPEG -hide_banner -encoders | grep -q libsvtav1
+          $FFMPEG -hide_banner -encoders | grep -q libopus
+          $FFMPEG -hide_banner -decoders | grep -q libdav1d
+          $FFMPEG -hide_banner -filters  | grep -q libvmaf
+
+          SRC_LAVFI="testsrc2=size=320x240:rate=30:duration=2"
+          echo "=== encode: SVT-AV1-PSY video + Opus audio ==="
+          $FFMPEG -hide_banner -y \
+            -f lavfi -i "$SRC_LAVFI" \
+            -f lavfi -i "sine=frequency=440:duration=2" \
+            -c:v libsvtav1 -preset 10 -crf 40 \
+            -svtav1-params "tune=3:enable-variance-boost=1" \
+            -c:a libopus -b:a 96k /tmp/smoke.mkv
+          test -s /tmp/smoke.mkv
+
+          echo "=== decode back (libdav1d) ==="
+          test "$($FFPROBE -v error -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 /tmp/smoke.mkv | tr -d '\r')" = av1
+
+          echo "=== VMAF scoring ==="
+          $FFMPEG -hide_banner -i /tmp/smoke.mkv -f lavfi -i "$SRC_LAVFI" \
+            -lavfi "[0:v][1:v]libvmaf=n_threads=2" -f null - 2>&1 | tee /tmp/vmaf.log
+          grep -q "VMAF score" /tmp/vmaf.log
 
       - name: Package
+        id: package
         run: |
-          cd "$DIST/ffmpeg-svtav1-psy-win64"
-          cp "$GITHUB_WORKSPACE/README.md" README.txt || true
+          OUT="$DIST/$PKG"
+          SVT_COMMIT="$(cat "$PREFIX/.svt-commit")"
+          STAMP="$(date -u +%Y%m%d-%H%M)"
+          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
+          echo "svt_commit=$SVT_COMMIT" >> "$GITHUB_OUTPUT"
+
+          cp README.md "$OUT/README.txt"
+          cp "$SRC/ffmpeg/COPYING.GPLv3" "$OUT/COPYING.GPLv3.txt"
+          cp "$SRC/ffmpeg/LICENSE.md" "$OUT/LICENSE.md"
+
+          cat > "$OUT/BUILDINFO.txt" <<EOF
+          ffmpeg-svtav1-psy-win64
+          built ${STAMP} UTC from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} @ ${GITHUB_SHA}
+
+          Components (all statically linked, all built from source in CI):
+            FFmpeg         ${FFMPEG_REF}          https://github.com/FFmpeg/FFmpeg
+            SVT-AV1-PSY    ${SVTAV1PSY_REF}       ${SVTAV1PSY_REPO}
+                           commit ${SVT_COMMIT}
+            libopus        ${OPUS_VERSION}        https://downloads.xiph.org/releases/opus/
+            libvmaf        v${VMAF_VERSION}       https://github.com/Netflix/vmaf
+            libdav1d       ${DAV1D_VERSION}       https://code.videolan.org/videolan/dav1d
+
+          Toolchain: mingw-w64 GCC cross-compiler on ubuntu-24.04
+
+          License: GPLv3 (configured with --enable-gpl --enable-version3).
+          The complete corresponding source is the set of tags listed above; the
+          exact build recipe is .github/workflows/build.yml in this repository.
+          See COPYING.GPLv3.txt and LICENSE.md.
+          EOF
+
           cd "$DIST"
-          zip -r -9 ffmpeg-svtav1-psy-win64.zip ffmpeg-svtav1-psy-win64
-          ls -lh ffmpeg-svtav1-psy-win64.zip
+          zip -r -9 "$PKG.zip" "$PKG"
+          sha256sum "$PKG.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-svtav1-psy-win64
-          path: dist/ffmpeg-svtav1-psy-win64.zip
+          name: ${{ env.PKG }}
+          path: |
+            dist/${{ env.PKG }}.zip
+            dist/SHA256SUMS.txt
           if-no-files-found: error
 
-      - name: Create / update Release
+      # Immutable, dated release so an older build can always be recovered.
+      - name: Publish versioned release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.package.outputs.stamp }}
+          name: FFmpeg ${{ env.FFMPEG_REF }} + SVT-AV1-PSY (${{ steps.package.outputs.stamp }})
+          body_path: dist/${{ env.PKG }}/BUILDINFO.txt
+          files: |
+            dist/${{ env.PKG }}.zip
+            dist/SHA256SUMS.txt
+
+      # Rolling pointer that the README links to.
+      - name: Update "latest" release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: FFmpeg Win64 + SVT-AV1-PSY + Opus (latest)
-          body: |
-            Statically-linked Windows x64 ffmpeg.exe with the SVT-AV1-PSY encoder
-            (5fish/svt-av1-psy) and libopus built in. Built by GitHub Actions.
-          files: dist/ffmpeg-svtav1-psy-win64.zip
+          body_path: dist/${{ env.PKG }}/BUILDINFO.txt
+          files: |
+            dist/${{ env.PKG }}.zip
+            dist/SHA256SUMS.txt

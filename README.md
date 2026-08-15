@@ -1,23 +1,36 @@
 # FFmpeg (Windows x64) — SVT-AV1-PSY + Opus
 
 Standalone, **statically linked** FFmpeg for Windows 64-bit with the
-**SVT-AV1-PSY** encoder ([5fish/svt-av1-psy](https://github.com/5fish/svt-av1-psy))
-and **libopus** built in. No DLLs, no install — just run `ffmpeg.exe`.
+**SVT-AV1-PSY** encoder ([5fish/SVT-AV1](https://github.com/5fish/SVT-AV1)),
+**libopus**, **libdav1d** and **libvmaf** built in.
+No DLLs, no install — just run `ffmpeg.exe`.
 
 Built automatically by GitHub Actions (see `.github/workflows/build.yml`).
-Grab the latest `ffmpeg-svtav1-psy-win64.zip` from the
-[Releases](../../releases/tag/latest) page or the workflow artifacts.
+Grab `ffmpeg-svtav1-psy-win64.zip` from the
+[Releases](../../releases/tag/latest) page.
+
+Verify your download against the `SHA256SUMS.txt` published next to it:
+
+```powershell
+(Get-FileHash ffmpeg-svtav1-psy-win64.zip -Algorithm SHA256).Hash.ToLower()
+```
 
 ## Contents
 - `ffmpeg.exe` — encoder/transcoder (SVT-AV1-PSY is in here)
 - `ffprobe.exe` — file/stream analysis
+- `BUILDINFO.txt` — exact versions and commits this binary was built from
 
 ## Versions
-- FFmpeg: `n7.1`
-- SVT-AV1-PSY: `5fish/svt-av1-psy` (2.3.0-C fork, branch `main`)
-- libopus: `1.5.2`
-- libvmaf: `3.0.0` (VMAF scoring, models built in)
+- FFmpeg: `n9.0.1`
+- SVT-AV1-PSY: [`5fish/SVT-AV1`](https://github.com/5fish/SVT-AV1) `v2.3.260719`
+- libopus: `1.6.1`
+- libvmaf: `3.2.0` (VMAF scoring, models built in)
+- libdav1d: `1.5.4` (fast AV1 decoding)
 - Toolchain: mingw-w64 GCC, static (SSE2…AVX512)
+
+Every source is pinned to an immutable tag, so any release can be rebuilt
+byte-for-byte from the recipe. `BUILDINFO.txt` inside the zip records what
+went into that specific build.
 
 ## Quick start
 
@@ -65,6 +78,9 @@ ffmpeg.exe -i encoded.mkv -i original.mkv ^
 
 The final `VMAF score: NN.NN` line is printed at the end (0–100, higher = better).
 
+AV1 inputs decode through **libdav1d**, so scoring an AV1 encode against an
+AV1 reference is fast rather than painfully slow.
+
 ## Common PSY / SVT params
 - `tune=0|1|2|3` — 0=VQ, 1=PSNR, 2=SSIM, 3=subjective/PSY
 - `enable-variance-boost=1`
@@ -79,6 +95,13 @@ The final `VMAF score: NN.NN` line is printed at the end (0–100, higher = bett
 
 ## Build it yourself
 Push to `main` or run the **workflow_dispatch** trigger in the Actions tab.
-The runner cross-compiles everything from source and publishes the zip.
+The runner cross-compiles everything from source, smoke-tests the resulting
+`.exe` under wine (real encode → decode → VMAF run), and publishes a dated
+release plus the rolling `latest` tag.
 
-License: **GPLv3** (`--enable-gpl --enable-version3`).
+To bump a component, edit the pinned version in the `env:` block of
+`.github/workflows/build.yml`. Dependency builds are cached and keyed on those
+versions, so unrelated changes only rebuild FFmpeg.
+
+License: **GPLv3** (`--enable-gpl --enable-version3`). Full license text and the
+list of upstream sources ship inside the zip.
