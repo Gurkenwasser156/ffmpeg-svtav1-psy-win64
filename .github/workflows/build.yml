@@ -246,16 +246,28 @@ jobs:
           $FFMPEG -hide_banner -filters  | grep -q libvmaf
 
           SRC_LAVFI="testsrc2=size=320x240:rate=30:duration=2"
-          # The -psy-bias options exist only in the 5fish fork, so a stock
-          # SVT-AV1 slipping in would fail here rather than ship silently.
           echo "=== encode: SVT-AV1-PSY video + Opus audio ==="
+          # Not piped into tee: that would mask ffmpeg's exit status.
           $FFMPEG -hide_banner -y \
             -f lavfi -i "$SRC_LAVFI" \
             -f lavfi -i "sine=frequency=440:duration=2" \
             -c:v libsvtav1 -preset 10 -crf 40 \
             -svtav1-params "lineart-psy-bias=3:texture-psy-bias=3" \
-            -c:a libopus -b:a 96k smoke.mkv
+            -c:a libopus -b:a 96k smoke.mkv > encode.log 2>&1 || { cat encode.log; exit 1; }
+          cat encode.log
           test -s smoke.mkv
+
+          # FFmpeg downgrades unknown -svtav1-params to a warning and encodes on
+          # regardless, so a stock SVT-AV1 would otherwise pass this test while
+          # silently dropping every PSY setting. Assert on the encoder's own
+          # banner and config instead of trusting the exit status.
+          if grep -qi "parsing option" encode.log; then
+            echo "::error::encoder rejected a -svtav1-params option"
+            exit 1
+          fi
+          grep -q "SVT-AV1 \[5fish\]" encode.log
+          grep -q "lineart PSY bias" encode.log
+          grep -q "texture PSY bias" encode.log
 
           echo "=== decode back (libdav1d) ==="
           test "$($FFPROBE -v error -select_streams v:0 \
